@@ -2,7 +2,7 @@ name: Test demo
 on: [push, workflow_dispatch]
 jobs:
   hello:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - run: echo "Part 3 demo OK"
       - run: python --version
