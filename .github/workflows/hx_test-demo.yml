@@ -1,5 +1,7 @@
 name: Test demo
+
 on: [push, workflow_dispatch]
+
 jobs:
   hello:
     runs-on: self-hosted
