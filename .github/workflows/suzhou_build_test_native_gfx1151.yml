@@ -6,8 +6,11 @@
 # Path B: local cmake/ninja build → build/dist/rocm → test_runner rocBLAS quick
 # (NOT artifact install from S3 — that is suzhou_test_native / test_component.yml)
 #
-# Runner: self-hosted label `linux-gfx1151-138` (confirm in GitHub → Settings → Actions → Runners)
+# Runner: self-hosted label (default linux-gfx1151-138)
 # Reference: Study_TheRock 阶段九 rocBLAS build-test docs
+#
+# NOTE: hanxing1205/TheRock restricts third-party Actions. This workflow uses
+# shell/git only — no actions/checkout, actions/upload-artifact, etc.
 
 name: Suzhou Build Test Native gfx1151
 
@@ -50,6 +53,10 @@ on:
         description: "Expected GoogleTest pass count (0 = do not assert)"
         type: string
         default: "272476"
+      runner_label:
+        description: "Suzhou self-hosted GPU runner label"
+        type: string
+        default: "linux-gfx1151-138"
   schedule:
     # SCH-W02: Saturday 01:00 CST = Friday 17:00 UTC
     - cron: "0 17 * * 5"
@@ -63,6 +70,7 @@ concurrency:
 
 env:
   VENV_DIR: ${{ github.workspace }}/.venv
+  LOG_DIR: ${{ github.workspace }}/suzhou-ci-logs
   BUILD_DIR: build
   ROCM_DIST: ${{ github.workspace }}/build/dist/rocm
   AMDGPU_FAMILIES: ${{ inputs.amdgpu_families || 'gfx1151' }}
@@ -76,16 +84,28 @@ env:
 jobs:
   build_and_test:
     name: Build→Test rocBLAS @ ${{ inputs.amdgpu_families || 'gfx1151' }}
-    runs-on: linux-gfx1151-138
+    runs-on: ${{ inputs.runner_label || 'linux-gfx1151-138' }}
     timeout-minutes: 720
     defaults:
       run:
         shell: bash
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          submodules: false
+      - name: Checkout repository (git, no third-party action)
+        run: |
+          set -euo pipefail
+          repo_url="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          if [[ -d .git ]]; then
+            git remote set-url origin "${repo_url}"
+            git fetch --depth 1 origin "${{ github.sha }}"
+            git checkout --force FETCH_HEAD
+            git reset --hard FETCH_HEAD
+            # Do not use `git clean -fdx` — it removes gitignored build/ and .venv
+          else
+            git clone --depth 1 "${repo_url}" .
+            git checkout "${{ github.sha }}"
+          fi
+          git rev-parse HEAD
+          git log -1 --oneline
 
       - name: Record runner info
         run: |
@@ -102,6 +122,21 @@ jobs:
             echo "| AMDGPU_FAMILIES | ${AMDGPU_FAMILIES} |"
             echo "| TEST | ${TEST_COMPONENT} / ${TEST_TYPE} |"
           } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Prepare log directory
+        run: |
+          mkdir -p "${LOG_DIR}" logs
+          {
+            echo "date_utc=$(date -u --iso-8601=seconds)"
+            echo "github_repository=${GITHUB_REPOSITORY}"
+            echo "github_run_id=${GITHUB_RUN_ID}"
+            echo "github_sha=${GITHUB_SHA}"
+            echo "runner_name=${RUNNER_NAME}"
+            echo "amdgpu_families=${AMDGPU_FAMILIES}"
+            echo "test_component=${TEST_COMPONENT}"
+            echo "test_type=${TEST_TYPE}"
+            echo "workflow_path=build/dist/rocm (local build)"
+          } | tee "${LOG_DIR}/workflow-context.txt"
 
       - name: Pre-job cleanup GPU processes
         timeout-minutes: 5
@@ -365,15 +400,17 @@ jobs:
             fi
           } >> "${GITHUB_STEP_SUMMARY}"
 
-      - name: Upload logs
+      - name: Archive logs on runner (no upload-artifact action)
         if: always()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: suzhou-build-test-logs-${{ github.run_id }}
-          path: |
-            logs/
-          if-no-files-found: warn
-          retention-days: 14
+        run: |
+          mkdir -p "${LOG_DIR}"
+          if [[ -d logs ]]; then
+            cp -a logs/. "${LOG_DIR}/" 2>/dev/null || true
+            tar -czf "${LOG_DIR}/build-test-logs-${GITHUB_RUN_ID}.tar.gz" -C "${{ github.workspace }}" logs
+          fi
+          echo "Logs directory: ${LOG_DIR}"
+          ls -la "${LOG_DIR}" || true
+          echo "log_dir=${LOG_DIR}" >> "${GITHUB_STEP_SUMMARY}"
 
       - name: Post-job cleanup GPU processes
         if: always()
