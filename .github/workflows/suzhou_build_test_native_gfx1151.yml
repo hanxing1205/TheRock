@@ -1,0 +1,381 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Suzhou Lab — Native Build→Test on gfx1151 self-hosted runner
+#
+# Path B: local cmake/ninja build → build/dist/rocm → test_runner rocBLAS quick
+# (NOT artifact install from S3 — that is suzhou_test_native / test_component.yml)
+#
+# Runner: self-hosted label `linux-gfx1151-138` (confirm in GitHub → Settings → Actions → Runners)
+# Reference: Study_TheRock 阶段九 rocBLAS build-test docs
+
+name: Suzhou Build Test Native gfx1151
+
+on:
+  workflow_dispatch:
+    inputs:
+      amdgpu_families:
+        description: "GPU family to build/test (e.g. gfx1151)"
+        type: string
+        default: gfx1151
+      test_component:
+        description: "Component for test_runner (e.g. rocblas)"
+        type: string
+        default: rocblas
+      test_type:
+        description: "Test category (quick / standard / comprehensive / full)"
+        type: string
+        default: quick
+      ninja_jobs:
+        description: "Parallel ninja jobs"
+        type: string
+        default: "12"
+      skip_fetch:
+        description: "Skip fetch_sources when submodules already present"
+        type: boolean
+        default: false
+      skip_configure:
+        description: "Skip cmake when build/ is already configured"
+        type: boolean
+        default: false
+      skip_build:
+        description: "Skip ninja build (test only)"
+        type: boolean
+        default: false
+      force_build:
+        description: "Force rebuild even if dist-rocm exists"
+        type: boolean
+        default: false
+      expected_passed:
+        description: "Expected GoogleTest pass count (0 = do not assert)"
+        type: string
+        default: "272476"
+  schedule:
+    # SCH-W02: Saturday 01:00 CST = Friday 17:00 UTC
+    - cron: "0 17 * * 5"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: suzhou-build-test-gfx1151
+  cancel-in-progress: false
+
+env:
+  VENV_DIR: ${{ github.workspace }}/.venv
+  BUILD_DIR: build
+  ROCM_DIST: ${{ github.workspace }}/build/dist/rocm
+  AMDGPU_FAMILIES: ${{ inputs.amdgpu_families || 'gfx1151' }}
+  TEST_COMPONENT: ${{ inputs.test_component || 'rocblas' }}
+  TEST_TYPE: ${{ inputs.test_type || 'quick' }}
+  NINJA_JOBS: ${{ inputs.ninja_jobs || '12' }}
+  LLVM_PARALLEL_LINK_JOBS: "1"
+  FLANG_PARALLEL_COMPILE_JOBS: "8"
+  EXPECTED_PASSED: ${{ inputs.expected_passed || '272476' }}
+
+jobs:
+  build_and_test:
+    name: Build→Test rocBLAS @ ${{ inputs.amdgpu_families || 'gfx1151' }}
+    runs-on: linux-gfx1151-138
+    timeout-minutes: 720
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          submodules: false
+
+      - name: Record runner info
+        run: |
+          {
+            echo "## Suzhou Lab Build→Test"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Runner | ${{ runner.name }} |"
+            echo "| OS | $(uname -a) |"
+            echo "| Workspace | ${{ github.workspace }} |"
+            echo "| Ref | ${{ github.ref }} |"
+            echo "| SHA | ${{ github.sha }} |"
+            echo "| AMDGPU_FAMILIES | ${AMDGPU_FAMILIES} |"
+            echo "| TEST | ${TEST_COMPONENT} / ${TEST_TYPE} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Pre-job cleanup GPU processes
+        timeout-minutes: 5
+        run: bash ./build_tools/github_actions/cleanup_processes.sh
+
+      - name: Disk space check
+        run: |
+          df -h "${{ github.workspace }}" || df -h .
+          avail_gb="$(df -BG "${{ github.workspace }}" 2>/dev/null | awk 'NR==2 {gsub(/G/,"",$4); print $4}' || df -BG . | awk 'NR==2 {gsub(/G/,"",$4); print $4}')"
+          echo "Available GB: ${avail_gb}"
+          if [[ "${avail_gb}" -lt 80 ]]; then
+            echo "::warning::Less than 80GB free — full BLAS build may fail (recommend 100GB+)"
+          fi
+
+      - name: Setup Python venv
+        run: |
+          python3 -m venv "${VENV_DIR}"
+          # shellcheck source=/dev/null
+          source "${VENV_DIR}/bin/activate"
+          pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install -r requirements-test.txt
+          python -V
+
+      - name: Adjust git config
+        run: |
+          git config --global --add safe.directory "${{ github.workspace }}"
+          git config fetch.parallel 10
+
+      - name: Runner health status
+        run: |
+          # shellcheck source=/dev/null
+          source "${VENV_DIR}/bin/activate"
+          python ./build_tools/health_status.py
+
+      - name: Driver / GPU sanity check
+        timeout-minutes: 3
+        run: |
+          # shellcheck source=/dev/null
+          source "${VENV_DIR}/bin/activate"
+          python ./build_tools/print_driver_gpu_info.py
+          rocminfo 2>/dev/null | grep -iE "Marketing Name|Name:.*gfx" | head -10 || true
+
+      - name: Fetch sources (rocm-libraries required)
+        if: ${{ inputs.skip_fetch != true }}
+        timeout-minutes: 60
+        run: |
+          # shellcheck source=/dev/null
+          source "${VENV_DIR}/bin/activate"
+          mkdir -p logs
+          python3 ./build_tools/fetch_sources.py \
+            --no-include-media-libs \
+            --no-include-debug-tools \
+            --no-include-ml-frameworks \
+            --depth 1 \
+            --progress \
+            2>&1 | tee "logs/fetch_sources_${GITHUB_RUN_ID}.log"
+          test -f rocm-libraries/projects/rocblas/CMakeLists.txt
+
+      - name: Apply gfx1151 Lab patches (inline, only when /opt/rocm exists)
+        run: |
+          if [[ ! -d /opt/rocm ]]; then
+            echo "No /opt/rocm — skipping Lab patches."
+            exit 0
+          fi
+          echo "Applying Lab patches for /opt/rocm coexistence..."
+
+          SQLITE_CMAKE="third-party/sysdeps/common/sqlite3/CMakeLists.txt"
+          if grep -q "INTERFACE_INCLUDE_DIRS" "${SQLITE_CMAKE}" \
+            && grep -q "lib/rocm_sysdeps/include" "${SQLITE_CMAKE}"; then
+            echo "[OK] sqlite3 patch already present"
+          else
+            python3 - <<'PY'
+          from pathlib import Path
+          path = Path("third-party/sysdeps/common/sqlite3/CMakeLists.txt")
+          text = path.read_text()
+          needle = (
+              "      INTERFACE_PKG_CONFIG_DIRS\n"
+              "        lib/rocm_sysdeps/lib/pkgconfig\n"
+          )
+          insert = needle + (
+              "      INTERFACE_INCLUDE_DIRS\n"
+              "        lib/rocm_sysdeps/include\n"
+          )
+          if needle in text:
+              path.write_text(text.replace(needle, insert, 1))
+              print("patched sqlite3")
+          else:
+              raise SystemExit("sqlite3 CMakeLists layout changed — patch manually")
+          PY
+          fi
+
+          cat > math-libs/BLAS/therock_openmp_fixup.cmake <<'CMAKE'
+          list(APPEND CMAKE_IGNORE_PATH
+            "/opt/rocm/llvm/lib/cmake/openmp"
+            "/opt/rocm/llvm"
+            "/opt/rocm"
+          )
+          if(DEFINED THEROCK_BINARY_DIR)
+            list(PREPEND CMAKE_PREFIX_PATH
+              "${THEROCK_BINARY_DIR}/compiler/amd-llvm/dist/lib/llvm"
+            )
+          endif()
+          find_package(OpenMP QUIET)
+          if(NOT TARGET OpenMP::OpenMP_CXX)
+            find_library(_THEROCK_LIBGOMP gomp)
+            if(_THEROCK_LIBGOMP)
+              add_library(OpenMP::OpenMP_CXX INTERFACE IMPORTED)
+              set_target_properties(OpenMP::OpenMP_CXX PROPERTIES
+                INTERFACE_COMPILE_OPTIONS "-fopenmp"
+                INTERFACE_LINK_LIBRARIES "${_THEROCK_LIBGOMP}"
+              )
+              message(STATUS "Lab OpenMP fixup: using libgomp fallback (blocked /opt/rocm)")
+            endif()
+          endif()
+          CMAKE
+
+          cat > math-libs/BLAS/pre_hook_hipBLAS.cmake <<'CMAKE'
+          include("${CMAKE_CURRENT_LIST_DIR}/therock_openmp_fixup.cmake")
+          CMAKE
+
+          ROC_PRE="math-libs/BLAS/pre_hook_rocBLAS.cmake"
+          if ! grep -q "therock_openmp_fixup.cmake" "${ROC_PRE}"; then
+            tmp="$(mktemp)"
+            {
+              echo '# Lab patch: block /opt/rocm OpenMP'
+              echo 'include("${CMAKE_CURRENT_LIST_DIR}/therock_openmp_fixup.cmake")'
+              echo ''
+              cat "${ROC_PRE}"
+            } > "${tmp}"
+            mv "${tmp}" "${ROC_PRE}"
+          fi
+          echo "Lab patches applied."
+
+      - name: Configure CMake (BLAS stack)
+        if: ${{ inputs.skip_configure != true }}
+        timeout-minutes: 30
+        run: |
+          # shellcheck source=/dev/null
+          source "${VENV_DIR}/bin/activate"
+          mkdir -p logs
+          cmake -B "${BUILD_DIR}" -GNinja . \
+            -DTHEROCK_ENABLE_ALL=OFF \
+            -DTHEROCK_ENABLE_COMPILER=ON \
+            -DTHEROCK_ENABLE_CORE_RUNTIME=ON \
+            -DTHEROCK_ENABLE_HIP_RUNTIME=ON \
+            -DTHEROCK_ENABLE_BLAS=ON \
+            -DTHEROCK_BUILD_TESTING=ON \
+            -DTHEROCK_AMDGPU_FAMILIES="${AMDGPU_FAMILIES}" \
+            -DFLANG_PARALLEL_COMPILE_JOBS="${FLANG_PARALLEL_COMPILE_JOBS}" \
+            -DLLVM_PARALLEL_LINK_JOBS="${LLVM_PARALLEL_LINK_JOBS}" \
+            2>&1 | tee "logs/cmake_configure_${GITHUB_RUN_ID}.log"
+
+      - name: Build rocBLAS stack and dist-rocm
+        if: ${{ inputs.skip_build != true }}
+        timeout-minutes: 660
+        run: |
+          # shellcheck source=/dev/null
+          source "${VENV_DIR}/bin/activate"
+          mkdir -p logs
+          logfile="logs/build_${GITHUB_RUN_ID}.log"
+
+          if [[ "${{ inputs.force_build }}" != "true" ]] \
+            && [[ -x "${ROCM_DIST}/bin/rocblas-test" ]] \
+            && [[ -d "${ROCM_DIST}/bin/rocblas" ]]; then
+            echo "dist-rocm already present — skipping ninja (use force_build=true to rebuild)"
+            exit 0
+          fi
+
+          test -f "${BUILD_DIR}/build.ninja" || { echo "build/ not configured"; exit 1; }
+
+          echo "ninja -j${NINJA_JOBS}, LLVM_PARALLEL_LINK_JOBS=${LLVM_PARALLEL_LINK_JOBS}"
+          ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" rocprofiler-sdk 2>&1 | tee "${logfile}"
+          ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" rocBLAS 2>&1 | tee -a "${logfile}"
+          ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" hipBLAS 2>&1 | tee -a "${logfile}"
+          ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" dist-rocm 2>&1 | tee -a "${logfile}"
+
+          ls -la "${ROCM_DIST}/lib/librocblas.so"*
+          ls -la "${ROCM_DIST}/bin/rocblas-test"
+
+      - name: Verify build artifacts
+        run: |
+          test -f "${ROCM_DIST}/lib/librocblas.so" || test -L "${ROCM_DIST}/lib/librocblas.so"
+          test -x "${ROCM_DIST}/bin/rocblas-test"
+          export LD_LIBRARY_PATH="${ROCM_DIST}/lib:${ROCM_DIST}/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH:-}"
+          ldd "${ROCM_DIST}/bin/rocblas-test" | grep -E 'rocblas|hipblas|not found'
+          if ldd "${ROCM_DIST}/bin/rocblas-test" | grep -q 'not found'; then
+            echo "::error::rocblas-test has unresolved libraries"
+            exit 1
+          fi
+          readlink -f "${ROCM_DIST}/lib/librocblas.so" || true
+
+      - name: Run test_runner (local dist)
+        id: test
+        timeout-minutes: 60
+        env:
+          ROCM_PATH: ${{ env.ROCM_DIST }}
+          THEROCK_BIN_DIR: ${{ env.ROCM_DIST }}/bin
+          OUTPUT_ARTIFACTS_DIR: ${{ env.ROCM_DIST }}
+          SHARD_INDEX: "1"
+          TOTAL_SHARDS: "1"
+          LD_LIBRARY_PATH: ${{ env.ROCM_DIST }}/lib:${{ env.ROCM_DIST }}/lib/rocm_sysdeps/lib
+        run: |
+          # shellcheck source=/dev/null
+          source "${VENV_DIR}/bin/activate"
+          mkdir -p logs
+          logfile="logs/test_${TEST_COMPONENT}_${TEST_TYPE}_${GITHUB_RUN_ID}.log"
+
+          bash ./build_tools/github_actions/cleanup_processes.sh
+          python ./build_tools/health_status.py
+          python ./build_tools/print_driver_gpu_info.py
+
+          echo "ROCM_PATH=${ROCM_PATH}"
+          echo "Test directory: ${THEROCK_BIN_DIR}/${TEST_COMPONENT}"
+
+          set -o pipefail
+          python ./build_tools/github_actions/test_executable_scripts/test_runner.py \
+            2>&1 | tee "${logfile}"
+
+          grep -E 'PASSED|failed out of|Test Directory' "${logfile}" | tail -20
+
+          if grep -q 'therock-build' "${logfile}"; then
+            echo "::error::Test used therock-build — expected build/dist/rocm"
+            exit 1
+          fi
+          if ! grep -q "build/dist/rocm" "${logfile}"; then
+            echo "::warning::Could not confirm build/dist/rocm in test log"
+          fi
+          if grep -qE '[1-9][0-9]* tests failed' "${logfile}"; then
+            echo "::error::Tests failed"
+            exit 1
+          fi
+
+          if [[ "${EXPECTED_PASSED}" != "0" ]]; then
+            passed="$(grep -oE '\[  PASSED  \] [0-9]+ tests' "${logfile}" | tail -1 | awk '{print $3}')"
+            echo "passed=${passed}"
+            if [[ -n "${passed}" && "${passed}" != "${EXPECTED_PASSED}" ]]; then
+              echo "::error::Expected ${EXPECTED_PASSED} passed, got ${passed}"
+              exit 1
+            fi
+          fi
+
+      - name: Write test summary
+        if: always()
+        run: |
+          logfile="logs/test_${TEST_COMPONENT}_${TEST_TYPE}_${GITHUB_RUN_ID}.log"
+          {
+            echo ""
+            echo "### Build→Test result"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Path | Native Build→Test (local dist) |"
+            echo "| ROCM_PATH | \`${ROCM_DIST}\` |"
+            echo "| Component | ${TEST_COMPONENT} / ${TEST_TYPE} |"
+            echo "| Job status | ${{ job.status }} |"
+            if [[ -f "${logfile}" ]]; then
+              grep -E 'PASSED|failed out of|Total Test time|rocBLAS version|Test Directory' "${logfile}" | tail -8 | while read -r line; do
+                echo "- ${line}"
+              done
+            fi
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: suzhou-build-test-logs-${{ github.run_id }}
+          path: |
+            logs/
+          if-no-files-found: warn
+          retention-days: 14
+
+      - name: Post-job cleanup GPU processes
+        if: always()
+        timeout-minutes: 5
+        run: bash ./build_tools/github_actions/cleanup_processes.sh
