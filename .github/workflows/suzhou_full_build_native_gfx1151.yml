@@ -33,6 +33,10 @@ on:
         description: "Enable mirage/emulation (requires cargo on runner)"
         type: boolean
         default: false
+      enable_media_libs:
+        description: "Enable rocdecode/rocjpeg (off avoids rocprofiler-sdk configure race)"
+        type: boolean
+        default: false
       skip_fetch:
         description: "Skip fetch_sources"
         type: boolean
@@ -79,6 +83,7 @@ env:
   TEST_TYPE: ${{ inputs.test_type || 'quick' }}
   NINJA_JOBS: ${{ inputs.ninja_jobs || '8' }}
   ENABLE_EMULATION: ${{ inputs.enable_emulation == true && 'ON' || 'OFF' }}
+  ENABLE_MEDIA_LIBS: ${{ inputs.enable_media_libs == true && 'ON' || 'OFF' }}
   LLVM_PARALLEL_LINK_JOBS: "1"
   FLANG_PARALLEL_COMPILE_JOBS: "8"
   EXPECTED_PASSED: ${{ inputs.expected_passed || '272476' }}
@@ -122,6 +127,7 @@ jobs:
             echo "| TEST | ${TEST_COMPONENT} / ${TEST_TYPE} |"
             echo "| ninja -j | ${NINJA_JOBS} |"
             echo "| THEROCK_ENABLE_EMULATION | ${ENABLE_EMULATION} |"
+            echo "| THEROCK_ENABLE_MEDIA_LIBS | ${ENABLE_MEDIA_LIBS} |"
           } >> "${GITHUB_STEP_SUMMARY}"
           free -h || true
           df -h "${{ github.workspace }}" || df -h .
@@ -245,6 +251,7 @@ jobs:
           cmake -B "${BUILD_DIR}" -GNinja . \
             -DTHEROCK_ENABLE_ALL=ON \
             -DTHEROCK_ENABLE_EMULATION="${ENABLE_EMULATION}" \
+            -DTHEROCK_ENABLE_MEDIA_LIBS="${ENABLE_MEDIA_LIBS}" \
             -DTHEROCK_BUILD_TESTING=ON \
             -DTHEROCK_AMDGPU_FAMILIES="${AMDGPU_FAMILIES}" \
             -DFLANG_PARALLEL_COMPILE_JOBS="${FLANG_PARALLEL_COMPILE_JOBS}" \
@@ -268,13 +275,53 @@ jobs:
           fi
 
           test -f "${BUILD_DIR}/build.ninja"
-          echo "ninja -j${NINJA_JOBS}, EMULATION=${ENABLE_EMULATION}" | tee "${logfile}"
+          echo "ninja -j${NINJA_JOBS}, EMULATION=${ENABLE_EMULATION}, MEDIA_LIBS=${ENABLE_MEDIA_LIBS}" | tee "${logfile}"
 
           set -o pipefail
-          if ! ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" 2>&1 | tee -a "${logfile}"; then
+
+          reset_rocprofiler_sdk_configure() {
+            rm -f "${BUILD_DIR}/profiler/rocprofiler-sdk/stamp/configure.stamp"
+            rm -rf "${BUILD_DIR}/profiler/rocprofiler-sdk/build"
+          }
+
+          recover_from_known_races() {
+            local recovered=false
             if grep -q "OffloadAPI.h" "${logfile}"; then
-              echo "::warning::amd-llvm OffloadAPI.h race — retrying amd-llvm at -j4"
+              echo "::warning::amd-llvm OffloadAPI.h race — retrying amd-llvm at -j4" | tee -a "${logfile}"
               ninja -C "${BUILD_DIR}" -j4 amd-llvm 2>&1 | tee -a "${logfile}"
+              recovered=true
+            fi
+            if grep -qE "rocdecode-targets\\.cmake|rocdecode_INCLUDE_DIR does not exist" "${logfile}"; then
+              echo "::warning::rocprofiler-sdk/rocdecode race — building rccl (+rocdecode) then reconfigure" | tee -a "${logfile}"
+              ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" rccl 2>&1 | tee -a "${logfile}"
+              if [[ "${ENABLE_MEDIA_LIBS}" == "ON" ]]; then
+                ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" rocdecode 2>&1 | tee -a "${logfile}"
+              else
+                rm -rf "${BUILD_DIR}/media-libs/rocdecode/build" \
+                  "${BUILD_DIR}/media-libs/rocdecode/stamp/configure.stamp" 2>/dev/null || true
+              fi
+              reset_rocprofiler_sdk_configure
+              recovered=true
+            fi
+            [[ "${recovered}" == "true" ]]
+          }
+
+          echo "Phase 1: amd-llvm + hip-clr (sequential, reduce LLVM/HIP races)" | tee -a "${logfile}"
+          if ! ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" amd-llvm 2>&1 | tee -a "${logfile}"; then
+            echo "::warning::amd-llvm failed — retry at -j4" | tee -a "${logfile}"
+            ninja -C "${BUILD_DIR}" -j4 amd-llvm 2>&1 | tee -a "${logfile}"
+          fi
+          ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" hip-clr 2>&1 | tee -a "${logfile}"
+
+          echo "Phase 2: rccl (+rocdecode) before rocprofiler-sdk parallel configure" | tee -a "${logfile}"
+          ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" rccl 2>&1 | tee -a "${logfile}"
+          if [[ "${ENABLE_MEDIA_LIBS}" == "ON" ]]; then
+            ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" rocdecode 2>&1 | tee -a "${logfile}"
+          fi
+
+          echo "Phase 3: full ninja" | tee -a "${logfile}"
+          if ! ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" 2>&1 | tee -a "${logfile}"; then
+            if recover_from_known_races; then
               ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" 2>&1 | tee -a "${logfile}"
             else
               exit 1
