@@ -26,9 +26,13 @@ on:
         type: string
         default: quick
       ninja_jobs:
-        description: "Parallel ninja jobs"
+        description: "Parallel ninja jobs (8 recommended for amd-llvm stability)"
         type: string
-        default: "12"
+        default: "8"
+      enable_emulation:
+        description: "Enable mirage/emulation (requires cargo on runner)"
+        type: boolean
+        default: false
       skip_fetch:
         description: "Skip fetch_sources"
         type: boolean
@@ -73,7 +77,8 @@ env:
   AMDGPU_FAMILIES: ${{ inputs.amdgpu_families || 'gfx1151' }}
   TEST_COMPONENT: ${{ inputs.test_component || 'rocblas' }}
   TEST_TYPE: ${{ inputs.test_type || 'quick' }}
-  NINJA_JOBS: ${{ inputs.ninja_jobs || '12' }}
+  NINJA_JOBS: ${{ inputs.ninja_jobs || '8' }}
+  ENABLE_EMULATION: ${{ inputs.enable_emulation == true && 'ON' || 'OFF' }}
   LLVM_PARALLEL_LINK_JOBS: "1"
   FLANG_PARALLEL_COMPILE_JOBS: "8"
   EXPECTED_PASSED: ${{ inputs.expected_passed || '272476' }}
@@ -116,6 +121,7 @@ jobs:
             echo "| AMDGPU_FAMILIES | ${AMDGPU_FAMILIES} |"
             echo "| TEST | ${TEST_COMPONENT} / ${TEST_TYPE} |"
             echo "| ninja -j | ${NINJA_JOBS} |"
+            echo "| THEROCK_ENABLE_EMULATION | ${ENABLE_EMULATION} |"
           } >> "${GITHUB_STEP_SUMMARY}"
           free -h || true
           df -h "${{ github.workspace }}" || df -h .
@@ -238,6 +244,7 @@ jobs:
           source "${VENV_DIR}/bin/activate"
           cmake -B "${BUILD_DIR}" -GNinja . \
             -DTHEROCK_ENABLE_ALL=ON \
+            -DTHEROCK_ENABLE_EMULATION="${ENABLE_EMULATION}" \
             -DTHEROCK_BUILD_TESTING=ON \
             -DTHEROCK_AMDGPU_FAMILIES="${AMDGPU_FAMILIES}" \
             -DFLANG_PARALLEL_COMPILE_JOBS="${FLANG_PARALLEL_COMPILE_JOBS}" \
@@ -261,8 +268,19 @@ jobs:
           fi
 
           test -f "${BUILD_DIR}/build.ninja"
-          echo "ninja -j${NINJA_JOBS}" | tee "${logfile}"
-          ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" 2>&1 | tee -a "${logfile}"
+          echo "ninja -j${NINJA_JOBS}, EMULATION=${ENABLE_EMULATION}" | tee "${logfile}"
+
+          set -o pipefail
+          if ! ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" 2>&1 | tee -a "${logfile}"; then
+            if grep -q "OffloadAPI.h" "${logfile}"; then
+              echo "::warning::amd-llvm OffloadAPI.h race — retrying amd-llvm at -j4"
+              ninja -C "${BUILD_DIR}" -j4 amd-llvm 2>&1 | tee -a "${logfile}"
+              ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" 2>&1 | tee -a "${logfile}"
+            else
+              exit 1
+            fi
+          fi
+
           ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" dist-rocm 2>&1 | tee -a "${logfile}"
 
           test -f "${ROCM_DIST}/include/hip/hip_runtime.h"
