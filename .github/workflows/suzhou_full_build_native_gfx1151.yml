@@ -284,29 +284,34 @@ jobs:
             rm -rf "${BUILD_DIR}/profiler/rocprofiler-sdk/build"
           }
 
-          ensure_hip_in_dist_rocm() {
+          ensure_rocprofiler_dist_prereqs() {
             local hip_clr_dist="${BUILD_DIR}/core/clr/dist"
-            if [[ -f "${ROCM_DIST}/include/hip/hip_runtime.h" ]]; then
-              echo "dist/rocm already has hip_runtime.h" | tee -a "${logfile}"
-            else
-              echo "Merging hip-clr into dist/rocm (rocprofiler-sdk needs --rocm-path)" | tee -a "${logfile}"
-              if ! ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" hip-clr+dist 2>&1 | tee -a "${logfile}"; then
-                echo "::warning::hip-clr+dist failed — trying dist-rocm" | tee -a "${logfile}"
-                ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" dist-rocm 2>&1 | tee -a "${logfile}" || true
-              fi
-              if [[ ! -f "${ROCM_DIST}/include/hip/hip_runtime.h" ]] \
-                && [[ -f "${hip_clr_dist}/include/hip/hip_runtime.h" ]]; then
-                echo "::warning::Bootstrapping ${ROCM_DIST}/include/hip from hip-clr dist" | tee -a "${logfile}"
-                mkdir -p "${ROCM_DIST}/include" "${ROCM_DIST}/lib"
-                cp -a "${hip_clr_dist}/include/." "${ROCM_DIST}/include/"
-                cp -a "${hip_clr_dist}/lib/." "${ROCM_DIST}/lib/" 2>/dev/null || true
-              fi
+            echo "Populating dist/rocm for rocprofiler-sdk (needs bin/amdclang++)" | tee -a "${logfile}"
+            if ! ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" \
+              artifact-sysdeps artifact-amd-llvm artifact-core-hip artifact-base \
+              2>&1 | tee -a "${logfile}"; then
+              echo "::warning::artifact populate partial — trying hip-clr+dist" | tee -a "${logfile}"
+              ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" hip-clr+dist 2>&1 | tee -a "${logfile}" || true
+            fi
+            if [[ ! -f "${ROCM_DIST}/include/hip/hip_runtime.h" ]] \
+              && [[ -f "${hip_clr_dist}/include/hip/hip_runtime.h" ]]; then
+              echo "::warning::Bootstrapping ${ROCM_DIST}/include/hip from hip-clr dist" | tee -a "${logfile}"
+              mkdir -p "${ROCM_DIST}/include" "${ROCM_DIST}/lib"
+              cp -a "${hip_clr_dist}/include/." "${ROCM_DIST}/include/"
+              cp -a "${hip_clr_dist}/lib/." "${ROCM_DIST}/lib/" 2>/dev/null || true
             fi
             if [[ ! -f "${ROCM_DIST}/include/hip/hip_runtime.h" ]]; then
-              echo "::error::hip_runtime.h missing in ${ROCM_DIST} after hip-clr merge"
+              echo "::error::hip_runtime.h missing in ${ROCM_DIST}"
+              exit 1
+            fi
+            if [[ ! -x "${ROCM_DIST}/bin/amdclang++" ]] \
+              && [[ ! -L "${ROCM_DIST}/bin/amdclang++" ]]; then
+              echo "::error::${ROCM_DIST}/bin/amdclang++ missing — rocprofiler-sdk will use compiler/amd-llvm/dist amdclang++ and fail .hip tests"
+              ls -la "${ROCM_DIST}/bin/" 2>/dev/null | head -20 | tee -a "${logfile}" || true
               exit 1
             fi
             echo "Verified: ${ROCM_DIST}/include/hip/hip_runtime.h" | tee -a "${logfile}"
+            echo "Verified: ${ROCM_DIST}/bin/amdclang++" | tee -a "${logfile}"
             reset_rocprofiler_sdk_configure
           }
 
@@ -330,9 +335,9 @@ jobs:
               recovered=true
             fi
             if grep -q "cannot find HIP runtime" "${logfile}"; then
-              echo "::warning::rocprofiler-sdk HIP runtime — merge hip-clr into dist/rocm and reconfigure" | tee -a "${logfile}"
+              echo "::warning::rocprofiler-sdk HIP runtime — populate dist/rocm artifacts and reconfigure" | tee -a "${logfile}"
               ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" hip-clr 2>&1 | tee -a "${logfile}"
-              ensure_hip_in_dist_rocm
+              ensure_rocprofiler_dist_prereqs
               recovered=true
             fi
             [[ "${recovered}" == "true" ]]
@@ -344,10 +349,16 @@ jobs:
             ninja -C "${BUILD_DIR}" -j4 amd-llvm 2>&1 | tee -a "${logfile}"
           fi
           ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" hip-clr 2>&1 | tee -a "${logfile}"
-          ensure_hip_in_dist_rocm
+          ensure_rocprofiler_dist_prereqs
 
           echo "Phase 2: rccl (+rocdecode) before rocprofiler-sdk parallel configure" | tee -a "${logfile}"
-          ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" rccl 2>&1 | tee -a "${logfile}"
+          if ! ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" rccl 2>&1 | tee -a "${logfile}"; then
+            if recover_from_known_races; then
+              ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" rccl 2>&1 | tee -a "${logfile}"
+            else
+              exit 1
+            fi
+          fi
           if [[ "${ENABLE_MEDIA_LIBS}" == "ON" ]]; then
             ninja -C "${BUILD_DIR}" -j"${NINJA_JOBS}" rocdecode 2>&1 | tee -a "${logfile}"
           fi
