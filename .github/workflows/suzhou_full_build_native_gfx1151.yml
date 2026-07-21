@@ -17,13 +17,18 @@ on:
         description: "GPU family (gfx1151)"
         type: string
         default: gfx1151
-      test_component:
+      @test_component:
         description: "test_runner component (e.g. rocblas)"
         type: string
         default: rocblas
       test_type:
         description: "quick / standard / comprehensive / full"
-        type: string
+        type: choice
+        options:
+          - quick
+          - standard
+          - comprehensive
+          - full
         default: quick
       ninja_jobs:
         description: "Parallel ninja jobs (8 recommended for amd-llvm stability)"

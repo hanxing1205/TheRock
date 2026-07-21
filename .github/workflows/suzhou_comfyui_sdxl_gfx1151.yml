@@ -1,0 +1,289 @@
+# Copyright Advanced Micro Devices, Inc.
+# SPDX-License-Identifier: MIT
+#
+# Suzhou Lab — ComfyUI + Stable Diffusion XL on gfx1151 self-hosted runner
+#
+# Purpose: kernel A/B performance smoke aligned with Canonical ComfyUI+SDXL workload.
+# Metrics: Average Inference Time (seconds) from workflow_inference.py output.
+#
+# IMPORTANT — kernel switch is manual (outside this workflow):
+#   1. Set /boot/vmlinuz + initrd.img symlinks on test-os (p4)
+#   2. reboot
+#   3. verify: uname -r
+#   4. Run this workflow with kernel_note describing the active kernel
+#   5. Repeat for the other kernel and compare Average Inference Time
+#
+# Prerequisites on runner (138):
+#   - test_case repo at TEST_CASE_DIR (see input below)
+#   - Passwordless sudo for runner user (test script runs apt/pip)
+#   - PyTorch with ROCm (torch.cuda.is_available() == True), OR set torch_pip_spec
+#   - Optional: TheRock build/dist/rocm for rocminfo + runtime libs
+#
+# NOTE: hanxing1205/TheRock restricts third-party Actions. Shell/git only.
+
+name: Suzhou ComfyUI SDXL gfx1151
+
+on:
+  workflow_dispatch:
+    inputs:
+      kernel_note:
+        description: "Human label for active kernel (e.g. 6.19-baseline / 7.1-candidate)"
+        type: string
+        default: ""
+      test_case_dir:
+        description: "Absolute path to test_case repo on the runner"
+        type: string
+        default: "/home/hx/actions-runner/test_case"
+      test_cycle:
+        description: "TEST_CYCLE passed to SDXL test script (>=2 recommended)"
+        type: string
+        default: "3"
+      rocm_dist:
+        description: "ROCm dist path (empty = <workspace>/build/dist/rocm)"
+        type: string
+        default: ""
+      torch_pip_spec:
+        description: "Optional pip install spec for torch (empty = skip install)"
+        type: string
+        default: ""
+      torch_pip_index:
+        description: "Optional pip --index-url for ROCm PyTorch wheels"
+        type: string
+        default: ""
+      skip_full_test_script:
+        description: "Skip shunit2 script; only verify torch+GPU (dry sanity)"
+        type: boolean
+        default: false
+      runner_label:
+        description: "Suzhou self-hosted GPU runner label"
+        type: string
+        default: "linux-gfx1151-138"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: suzhou-comfyui-sdxl-gfx1151
+  cancel-in-progress: false
+
+env:
+  LOG_DIR: ${{ github.workspace }}/suzhou-ci-logs
+  TEST_CYCLE: ${{ inputs.test_cycle || '3' }}
+  KERNEL_NOTE: ${{ inputs.kernel_note || '' }}
+
+jobs:
+  comfyui_sdxl:
+    name: ComfyUI SDXL @ gfx1151
+    runs-on: ${{ inputs.runner_label || 'linux-gfx1151-138' }}
+    timeout-minutes: 480
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout repository (git, no third-party action)
+        run: |
+          set -euo pipefail
+          repo_url="https://x-access-token:${{ github.token }}@github.com/${{ github.repository }}.git"
+          if [[ -d .git ]]; then
+            git remote set-url origin "${repo_url}"
+            git fetch --depth 1 origin "${{ github.sha }}"
+            git checkout --force FETCH_HEAD
+            git reset --hard FETCH_HEAD
+          else
+            git clone --depth 1 "${repo_url}" .
+            git checkout "${{ github.sha }}"
+          fi
+          git rev-parse HEAD
+          git log -1 --oneline
+
+      - name: Record runner and kernel info
+        run: |
+          mkdir -p "${LOG_DIR}" logs
+          kver="$(uname -r)"
+          {
+            echo "## Suzhou Lab ComfyUI SDXL"
+            echo ""
+            echo "| Item | Value |"
+            echo "|------|-------|"
+            echo "| Runner | ${{ runner.name }} |"
+            echo "| Kernel (uname -r) | \`${kver}\` |"
+            echo "| Kernel note | ${KERNEL_NOTE:-n/a} |"
+            echo "| OS | $(uname -a) |"
+            echo "| TEST_CASE_DIR | ${{ inputs.test_case_dir }} |"
+            echo "| TEST_CYCLE | ${TEST_CYCLE} |"
+            echo "| GitHub Run | ${GITHUB_RUN_ID} |"
+          } >> "${GITHUB_STEP_SUMMARY}"
+          {
+            echo "date_utc=$(date -u --iso-8601=seconds)"
+            echo "kernel=${kver}"
+            echo "kernel_note=${KERNEL_NOTE}"
+            echo "github_run_id=${GITHUB_RUN_ID}"
+          } | tee "${LOG_DIR}/comfyui-context.txt"
+
+      - name: Resolve paths and sanity checks
+        id: paths
+        run: |
+          set -euo pipefail
+          TEST_CASE_DIR="${{ inputs.test_case_dir }}"
+          SUITE_DIR="${TEST_CASE_DIR}/suites/comfyui_text_to_image"
+          if [[ ! -d "${SUITE_DIR}" ]]; then
+            echo "::error::TEST_CASE_DIR not found: ${SUITE_DIR}"
+            echo "Clone test_case on the runner or set test_case_dir input."
+            exit 1
+          fi
+          if [[ -n "${{ inputs.rocm_dist }}" ]]; then
+            ROCM_DIST="${{ inputs.rocm_dist }}"
+          else
+            ROCM_DIST="${{ github.workspace }}/build/dist/rocm"
+          fi
+          echo "test_case_dir=${TEST_CASE_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "suite_dir=${SUITE_DIR}" >> "${GITHUB_OUTPUT}"
+          echo "rocm_dist=${ROCM_DIST}" >> "${GITHUB_OUTPUT}"
+          echo "TEST_CASE_DIR=${TEST_CASE_DIR}" >> "${GITHUB_ENV}"
+          echo "SUITE_DIR=${SUITE_DIR}" >> "${GITHUB_ENV}"
+          echo "ROCM_DIST=${ROCM_DIST}" >> "${GITHUB_ENV}"
+          ls -la "${SUITE_DIR}"
+
+      - name: Pre-job cleanup GPU processes
+        timeout-minutes: 5
+        run: |
+          if [[ -x ./build_tools/github_actions/cleanup_processes.sh ]]; then
+            bash ./build_tools/github_actions/cleanup_processes.sh
+          fi
+
+      - name: Setup Python venv
+        run: |
+          python3 -m venv "${{ github.workspace }}/.venv-comfyui"
+          # shellcheck source=/dev/null
+          source "${{ github.workspace }}/.venv-comfyui/bin/activate"
+          pip install --upgrade pip
+          pip install websocket-client pandas
+          python -V
+
+      - name: Optional PyTorch install
+        if: ${{ inputs.torch_pip_spec != '' }}
+        run: |
+          # shellcheck source=/dev/null
+          source "${{ github.workspace }}/.venv-comfyui/bin/activate"
+          if [[ -n "${{ inputs.torch_pip_index }}" ]]; then
+            pip install --index-url "${{ inputs.torch_pip_index }}" "${{ inputs.torch_pip_spec }}"
+          else
+            pip install "${{ inputs.torch_pip_spec }}"
+          fi
+
+      - name: Export ROCm runtime environment
+        run: |
+          set -euo pipefail
+          if [[ -d "${ROCM_DIST}/bin" ]]; then
+            echo "PATH=${ROCM_DIST}/bin:${PATH}" >> "${GITHUB_ENV}"
+          fi
+          if [[ -d "${ROCM_DIST}/lib" ]]; then
+            echo "LD_LIBRARY_PATH=${ROCM_DIST}/lib:${ROCM_DIST}/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH:-}" >> "${GITHUB_ENV}"
+            echo "ROCM_PATH=${ROCM_DIST}" >> "${GITHUB_ENV}"
+          fi
+          if [[ -x "${ROCM_DIST}/bin/rocminfo" ]]; then
+            "${ROCM_DIST}/bin/rocminfo" | grep -iE "Marketing Name|Name:.*gfx" | head -10 || true
+          fi
+
+      - name: Verify PyTorch GPU
+        run: |
+          # shellcheck source=/dev/null
+          source "${{ github.workspace }}/.venv-comfyui/bin/activate"
+          python3 - <<'PY'
+          import torch
+          ok = torch.cuda.is_available()
+          print(f"torch={torch.__version__} cuda_available={ok}")
+          if not ok:
+              raise SystemExit(
+                  "torch.cuda.is_available() is False. "
+                  "Install ROCm PyTorch on the runner or set torch_pip_spec input."
+              )
+          print(f"device={torch.cuda.get_device_name(0)}")
+          PY
+
+      - name: Dry sanity only
+        if: ${{ inputs.skip_full_test_script }}
+        run: |
+          echo "skip_full_test_script=true — GPU/torch sanity passed; SDXL not executed."
+
+      - name: Run ComfyUI SDXL test (test_case script)
+        id: sdxl
+        if: ${{ inputs.skip_full_test_script != true }}
+        working-directory: ${{ env.SUITE_DIR }}
+        run: |
+          set -euo pipefail
+          # shellcheck source=/dev/null
+          source "${{ github.workspace }}/.venv-comfyui/bin/activate"
+          export TEST_CYCLE
+          logfile="${{ github.workspace }}/logs/comfyui_sdxl_${GITHUB_RUN_ID}.log"
+          mkdir -p "${{ github.workspace }}/logs"
+
+          set +e
+          sudo -E env PATH="${PATH}" LD_LIBRARY_PATH="${LD_LIBRARY_PATH:-}" \
+            TEST_CYCLE="${TEST_CYCLE}" \
+            bash ./test_comfyui_text2image_stable-diffusion-xl-base-1.0.sh \
+            2>&1 | tee "${logfile}"
+          script_rc=${PIPESTATUS[0]}
+          set -e
+
+          # tearDown may fail on first run (no regression JSON baseline) — recover metrics
+          avg="$(grep -oE 'Average Inference Time = [0-9.]+ seconds' "${logfile}" | tail -1 \
+            | grep -oE '[0-9.]+')"
+          first="$(grep -oE 'First Inference Time = [0-9.]+ seconds' "${logfile}" | tail -1 \
+            | grep -oE '[0-9.]+')"
+
+          if [[ -z "${avg}" ]]; then
+            echo "::error::No Average Inference Time in log (script rc=${script_rc})"
+            tail -80 "${logfile}" || true
+            exit 1
+          fi
+
+          echo "first_inference_sec=${first:-n/a}" >> "${GITHUB_OUTPUT}"
+          echo "average_inference_sec=${avg}" >> "${GITHUB_OUTPUT}"
+          echo "script_rc=${script_rc}" >> "${GITHUB_OUTPUT}"
+
+          if [[ "${script_rc}" -ne 0 ]]; then
+            echo "::warning::Test script exited ${script_rc} (often tearDown regression JSON). Metrics captured."
+          fi
+
+      - name: Write SDXL summary
+        if: always() && inputs.skip_full_test_script != true
+        run: |
+          {
+            echo ""
+            echo "### ComfyUI SDXL result"
+            echo ""
+            echo "| Field | Value |"
+            echo "|-------|-------|"
+            echo "| Kernel | \`$(uname -r)\` |"
+            echo "| Kernel note | ${KERNEL_NOTE:-n/a} |"
+            echo "| First Inference Time (s) | ${{ steps.sdxl.outputs.first_inference_sec || 'n/a' }} |"
+            echo "| **Average Inference Time (s)** | **${{ steps.sdxl.outputs.average_inference_sec || 'n/a' }}** |"
+            echo "| Script exit code | ${{ steps.sdxl.outputs.script_rc || 'n/a' }} |"
+            echo ""
+            echo "Compare **Average Inference Time** across kernel A/B runs."
+            echo "Canonical issue reference: ~9s good vs ~388s bad (40×)."
+          } >> "${GITHUB_STEP_SUMMARY}"
+
+      - name: Archive logs on runner
+        if: always()
+        run: |
+          mkdir -p "${LOG_DIR}"
+          if [[ -d logs ]]; then
+            cp -a logs/. "${LOG_DIR}/" 2>/dev/null || true
+          fi
+          if [[ -f "${{ github.workspace }}/logs/comfyui_sdxl_${GITHUB_RUN_ID}.log" ]]; then
+            cp "${{ github.workspace }}/logs/comfyui_sdxl_${GITHUB_RUN_ID}.log" "${LOG_DIR}/"
+          fi
+          ls -la "${LOG_DIR}" || true
+
+      - name: Post-job cleanup GPU processes
+        if: always()
+        timeout-minutes: 5
+        run: |
+          if [[ -x ./build_tools/github_actions/cleanup_processes.sh ]]; then
+            bash ./build_tools/github_actions/cleanup_processes.sh
+          fi
+          if [[ -d "${SUITE_DIR}/ComfyUI" ]]; then
+            python3 "${SUITE_DIR}/scripts/run_comfyui_server.py" --kill-server 2>/dev/null || true
+          fi
